@@ -1,334 +1,330 @@
-# LLM × Home Assistant 整合優化：從 8 秒到 1 秒的實戰記錄
+# LLM x Home Assistant Integration Optimization: From 8s to 1s
 
-**日期：** 2026-02-20  
-**作者：** Jarvis (main agent) + Cody (CTO subagent)  
-**環境：** AWS EC2 (us-east-1) → Home Assistant OS (via Tailscale) → Samsung AU9000 TV  
-**模型：** Claude Haiku 4.5 on AWS Bedrock
-
----
-
-## 問題背景
-
-Molly 是我們的智能家居 AI agent，負責透過 Home Assistant 控制家中裝置。使用者對她說「把電視關掉」，她需要：
-
-1. 理解自然語言指令
-2. 找到正確的 Home Assistant entity_id
-3. 呼叫 HA API 執行動作
-4. 回報結果
-
-**問題是：這個流程端到端需要 8 秒以上。**
-
-使用者說「關電視」，等 8 秒才看到回應——這不是智能家居，這是智障家居。我們的目標是把這個數字壓到可接受的範圍。
+**Date:** 2026-02-20
+**Author:** Jarvis (main agent) + Cody (CTO subagent)
+**Environment:** AWS EC2 (us-east-1) to Home Assistant OS (via Tailscale) to Samsung AU9000 TV
+**Model:** Claude Haiku 4.5 on AWS Bedrock
 
 ---
 
-## Phase 1：拆解延遲——瓶頸在哪裡？
+## Background
 
-在優化之前，我們需要知道時間花在哪裡。端到端流程有兩個主要環節：
+Molly is our smart home AI agent responsible for controlling home devices through Home Assistant. When a user says "turn off the TV," she needs to:
 
-- **HA API 層**：EC2 → Tailscale → 家裡的 HA → 裝置
-- **LLM 推理層**：把使用者的話翻譯成 HA API 呼叫
+1. Understand the natural language command
+2. Find the correct Home Assistant entity_id
+3. Call the HA API to execute the action
+4. Report the result
+
+**The problem: this end-to-end flow took over 8 seconds.**
+
+A user says "turn off the TV" and waits 8 seconds for a response. That is not a smart home. Our goal was to bring this number down to an acceptable range.
+
+---
+
+## Phase 1: Decomposing Latency - Where is the Bottleneck?
+
+Before optimizing, we needed to know where the time was being spent. The end-to-end flow has two main segments:
+
+- **HA API layer**: EC2 to Tailscale to home HA to device
+- **LLM inference layer**: translating user speech into HA API calls
 
 ### HA API Baseline
 
-我們分別測試了三種 HA API 呼叫方式：
+We tested three HA API call methods separately:
 
-| API 方式 | 平均延遲 | 說明 |
+| API Method | Avg Latency | Notes |
 |---------|---------|------|
-| REST API — 單一 entity 查詢 | **562ms** | `GET /api/states/{entity_id}` |
-| REST API — 全部 entity batch | **883ms** | `GET /api/states`（43 entities）|
-| Assist API — 自然語言 | **583ms** | `POST /api/conversation/process` |
+| REST API single entity query | **562ms** | `GET /api/states/{entity_id}` |
+| REST API all entities batch | **883ms** | `GET /api/states` (43 entities) |
+| Assist API natural language | **583ms** | `POST /api/conversation/process` |
 
-**發現：** HA API 本身穩定在 500-900ms。這是 EC2 → Tailscale → 家庭網路的物理延遲，除非改部署架構否則無法大幅壓縮。單一 entity 查詢跟 batch 差約 300ms，是 HA 序列化 43 個 entity 的成本。
+**Finding:** The HA API itself is stable at 500-900ms. This is the physical latency of EC2 to Tailscale to home network; it cannot be significantly reduced without changing the deployment architecture. The single-entity query vs. batch differs by ~300ms, which is the cost of HA serializing all 43 entities.
 
 ### LLM Inference Baseline
 
-用 Haiku 4.5 測試不同類型的指令：
+Tested Haiku 4.5 with different types of commands:
 
-| 指令類型 | 平均延遲 | Output Tokens | 說明 |
+| Command Type | Avg Latency | Output Tokens | Notes |
 |---------|---------|--------------|------|
-| 單一控制（「開電視」）| 1,231ms | 29 | 最簡單 |
-| 狀態查詢（「TV 開著嗎」）| 1,475ms | 99 | 需要查找 + 回答 |
-| 中文自然語言 | 2,261ms | 29 | 中文解析開銷 |
-| 人物查詢（「某人在哪」）| **3,615ms** | **89** | 最慢——LLM 不知道 entity_id |
+| Single control ("turn on TV") | 1,231ms | 29 | Simplest |
+| State query ("Is the TV on?") | 1,475ms | 99 | Requires lookup + answer |
+| Natural language | 2,261ms | 29 | Parsing overhead |
+| Person location query ("Where is someone?") | **3,615ms** | **89** | Slowest - LLM does not know entity_id |
 
-**關鍵發現：延遲跟 output tokens 高度正相關。** 人物查詢最慢不是因為問題複雜，而是 LLM 在「猜」entity_id。它不知道對應的 `device_tracker` entity ID，所以會生成一堆推理文字（「讓我查找...」「根據 Home Assistant 的命名規則...」），吃掉 89 個 output tokens。
+**Key finding: latency is highly correlated with output token count.** The person-location query is slowest not because the question is complex, but because the LLM is guessing the entity_id. It does not know the corresponding `device_tracker` entity ID, so it generates a lot of reasoning text, consuming 89 output tokens.
 
-**整體統計：LLM avg=2,068ms, p50=1,479ms, p95=3,770ms**
+**Overall stats: LLM avg=2,068ms, p50=1,479ms, p95=3,770ms**
 
-### Baseline 延遲組成
+### Baseline Latency Breakdown
 
 ```
-端到端 ~8,000ms 拆解：
+End-to-end ~8,000ms breakdown:
 
-  HA API    ████░░░░░░░░░░░░░░░░  ~700ms   (9%)
-  LLM 推理  ██████████████████░░  ~2,840ms (35%)
-  LLM 猜測  ████████████████████  ~4,400ms (56%) ← 瓶頸！
+  HA API:        ~700ms   (9%)
+  LLM Inference: ~2,840ms (35%)
+  LLM Guessing:  ~4,400ms (56%) -- Bottleneck!
 
-  最大的時間浪費：LLM 在猜 entity_id
+  Biggest time waste: LLM guessing entity_ids
 ```
 
-**結論：瓶頸不在 HA API，也不只是 LLM 推理速度——而是 LLM 根本不知道你家的裝置叫什麼名字，花了大量 token 在猜測和推理。**
+**Conclusion: The bottleneck is not the HA API, nor just LLM inference speed - it is that the LLM simply does not know the names of the devices in your home, and spends a huge number of tokens guessing and reasoning.**
 
 ---
 
-## Phase 2：Entity Cache — 讓 LLM 不用猜
+## Phase 2: Entity Cache - Eliminating the Guesswork
 
-### 思路
+### Approach
 
-既然 LLM 最大的時間浪費是在猜 entity_id，那最直接的解法就是：**直接告訴它你家有哪些裝置。**
+Since the LLM biggest time waste is guessing entity_ids, the most direct fix is: **just tell it what devices are in your home.**
 
-我們從 HA API 拉取所有 43 個 entity，建立一個本地 cache 檔案（`.ha-entities.json`），然後把常用的 14 個 entity 直接注入 Molly 的 system prompt。
+We pulled all 43 entities from the HA API, built a local cache file (.ha-entities.json), and injected the 14 most commonly used entities directly into Molly system prompt.
 
-### 做法
+### Implementation
 
-1. 建立 `ha-update-cache.sh`——從 `GET /api/states` 拉全部 entity，存成 JSON（含 entity_id、friendly_name、domain、state）
-2. 把常用 entity list 寫進 Molly 的 SOUL.md（system prompt 的一部分）
-3. 在 heartbeat 機制中定期刷新 cache，自動偵測新裝置
+1. Created ha-update-cache.sh - pulls all entities from GET /api/states, saves as JSON
+2. Wrote the common entity list into Molly SOUL.md (part of the system prompt)
+3. Periodically refreshes the cache via the heartbeat mechanism, auto-detecting new devices
 
-注入的格式：
+Format example:
 ```
-- media_player.ke_ting_dian_shi_samsung — 客廳電視 Samsung
-- device_tracker.user_phone — 使用者（手機位置）
-- sensor.sun_next_setting — 下次日落時間
+- media_player.ke_ting_dian_shi_samsung -- Living room TV Samsung
+- device_tracker.user_phone -- User (phone location)
+- sensor.sun_next_setting -- Next sunset time
 ```
 
-### Prompt 對比測試
+### Prompt Comparison Test
 
-同樣 5 個指令，跑 Baseline（無 entity list）vs Optimized（有 entity list）：
+Same 5 commands, run with Baseline (no entity list) vs Optimized (with entity list):
 
-| 指令 | Baseline 延遲 | Optimized 延遲 | Baseline Out Tokens | Optimized Out Tokens |
+| Command | Baseline Latency | Optimized Latency | Baseline Out Tokens | Optimized Out Tokens |
 |-----|-------------|--------------|-------------------|-------------------|
-| TV 現在開著嗎？ | 1,889ms | 3,681ms | 86 | 36 |
-| Mr. X 在不在家 | **6,071ms** | **1,714ms** | **200** | **28** | 
-| 把客廳電視關掉 | 1,900ms | 4,091ms | 92 | 48 |
-| 現在幾點日落？ | 4,710ms | 4,953ms | 200 | 85 |
-| 有幾個媒體播放器？ | 4,059ms | 2,577ms | 148 | 167 |
+| Is the TV on right now? | 1,889ms | 3,681ms | 86 | 36 |
+| Is someone home? | **6,071ms** | **1,714ms** | **200** | **28** |
+| Turn off the living room TV | 1,900ms | 4,091ms | 92 | 48 |
+| What time is sunset today? | 4,710ms | 4,953ms | 200 | 85 |
+| How many media players are there? | 4,059ms | 2,577ms | 148 | 167 |
 
-### 分析
+### Analysis
 
-乍看之下結果很矛盾——有些指令 Optimized 反而更慢？但看 output tokens 就能理解：
+At first glance the results look contradictory - some commands are actually slower with the optimized prompt. But looking at output tokens explains it:
 
-**Output tokens 平均從 145 → 73，減少 50%。** Optimized prompt 讓 LLM 直接輸出 entity_id，不再生成推理文字。但 input tokens 增加了 ~1,250（entity list 的成本），在某些簡單指令上 input 增加的延遲 > output 減少的收益。
+**Average output tokens dropped from 145 to 73, a 50% reduction.** The optimized prompt lets the LLM output the entity_id directly without generating reasoning text. However, input tokens increased by ~1,250 (the cost of the entity list), so for simple commands the added input latency outweighs the savings from fewer output tokens.
 
-**真正的價值在「難題」上。** 「某人在不在家」這個查詢：
-- Baseline：LLM 不知道 entity_id → 猜測 → 200 tokens → **6,071ms**
-- Optimized：直接查表 → 28 tokens → **1,714ms**（**-72%**）
+**The real value shows up on hard queries.** The "Is someone home?" query:
+- Baseline: LLM does not know entity_id, guesses, 200 tokens, 6,071ms
+- Optimized: looks up the table directly, 28 tokens, 1,714ms (-72%)
 
-**統計摘要：**
+**Summary stats:**
 
-| 指標 | Baseline | Optimized | 改善 |
+| Metric | Baseline | Optimized | Improvement |
 |-----|---------|----------|------|
-| 平均延遲 | 3,726ms | 3,403ms | -8.7% |
-| 平均 output tokens | 145 | 73 | **-50%** |
-| 最差延遲 | 6,071ms | 4,953ms | -18.4% |
-| entity 準確度 | 低（常猜錯）| 高（查表）| 質量 ↑↑ |
+| Avg latency | 3,726ms | 3,403ms | -8.7% |
+| Avg output tokens | 145 | 73 | **-50%** |
+| Worst latency | 6,071ms | 4,953ms | -18.4% |
+| Entity accuracy | Low (often wrong) | High (lookup table) | Quality up |
 
-**Phase 2 結論：Entity cache 是 ROI 最高的單一優化。** 成本幾乎為零（多 ~1,250 input tokens ≈ $0.0003/次），但讓最慢的查詢從 6 秒降到 1.7 秒，且 entity 辨識從猜測變成查表。
+**Phase 2 conclusion: Entity cache is the single highest-ROI optimization.** The cost is nearly zero (adds ~1,250 input tokens, approximately $0.0003 per call), but brings the slowest queries from 6 seconds down to 1.7 seconds, and entity recognition goes from guessing to table lookup.
 
 ---
 
-## Phase 3：Direct Exec + State Injection — 壓縮 LLM 輸出
+## Phase 3: Direct Exec + State Injection - Compressing LLM Output
 
-### 思路
+### Approach
+Phase 2 solved the "LLM does not know entity_ids" problem, but the LLM output is still too verbose. When answering, it generates a lengthy preamble before the exec command - for example, a 104-token response where only the 43-token exec command is actually useful. The remaining 61 tokens are filler, and every token consumes inference time.
+Phase 2 solved the "LLM does not know entity_ids" problem, but the LLM output is still too verbose. When answering, it generates a lengthy preamble before the exec command - for example, a 104-token response where only the 43-token exec command is actually useful. The remaining 61 tokens are filler, and every token consumes inference time.
+Additionally, in Phase 2 we tried having the LLM read the cache directly to determine device states, and discovered a serious problem: **the LLM hallucinates.** It sees the instruction in SOUL.md saying "read the cache to query state," but it does not actually read the file - it just guesses a plausible state based on training data. This makes responses unreliable.
+Additionally, in Phase 2 we tried having the LLM read the cache directly to determine device states, and discovered a serious problem: **the LLM hallucinates.** It sees the instruction in SOUL.md saying "read the cache to query state," but it does not actually read the file - it just guesses a plausible state based on training data. This makes responses unreliable.
 
-Phase 2 解決了「LLM 不知道 entity_id」的問題，但 LLM 的 output 還是太多。它在回答時會說：
+### Implementation
 
-> 「我來幫你關掉客廳電視。根據當前狀態，Samsung AU9000 55 TV 目前是開啟的，所以執行關閉指令：exec ha-service.sh media_player turn_off media_player.ke_ting_dian_shi_samsung」
+**1. Strict output constraints**
 
-這段話有 104 個 tokens，但真正有用的只有 exec 指令那 43 個 tokens。剩下的 61 個 tokens 是廢話，每個 token 都在消耗 inference 時間。
+Added explicit rules to the system prompt:
+- When reporting state: output exactly one sentence (e.g. "The living room TV is currently off.")
+- Forbidden phrases: "I will execute...", "Based on current state..."
+- Forbidden phrases: "I will execute...", "Based on current state..."
 
-另外，我們在 Phase 2 中嘗試讓 LLM 自己讀 cache 來判斷裝置狀態，發現一個嚴重問題：**LLM 會幻覺。** 它看到 SOUL.md 裡的指令說「讀 cache 查詢狀態」，但它並不真的去讀檔案——它只是根據訓練數據猜一個可能的狀態。這導致回答不可靠。
+**2. State Injection**
 
-### 做法
-
-**1. 嚴格輸出限制**
-
-在 system prompt 中加入明確規則：
-- 執行動作時：**只輸出 exec 指令本身**，禁止前言、解釋、Markdown code block
-- 回報狀態時：**只輸出一句話**（「客廳電視目前是關閉的。」）
-- 禁止：「我將執行...」、「根據當前狀態...」
-
-**2. 狀態注入（State Injection）**
-
-不讓 LLM 自己去讀 cache，而是在每次呼叫前，由 `ha-state-inject.sh` 從 HA API 拉取即時狀態，直接注入到 LLM context 中：
+Instead of letting the LLM read the cache, ha-state-inject.sh fetches the live state from the HA API before each call and injects it directly into the LLM context:
 
 ```
 === Device States (19:18 UTC) ===
-media_player.ke_ting_dian_shi_samsung=off (客廳電視 Samsung)
-media_player.samsung_au9000_55_tv_2=on (房間電視 Samsung AU9000 55 TV)
-device_tracker.user_phone=not_home (使用者)
+media_player.ke_ting_dian_shi_samsung=off (Living room TV Samsung)
+media_player.samsung_au9000_55_tv_2=on (Bedroom TV Samsung AU9000 55 TV)
+device_tracker.user_phone=not_home (User)
 ```
 
-LLM 不需要「查」任何東西——狀態已經在 context 裡了。它只需要根據狀態做判斷。
+The LLM does not need to look up anything - the state is already in context. It only needs to make decisions based on the provided state.
 
-**3. Friendly Name 標記**
+**3. Friendly Name Labels**
 
-測試中發現 LLM 會搞混 `samsung_au9000_55_tv` 和 `samsung_au9000_55_tv_2`（兩個 entity_id 很像），導致控制到錯的電視。解法：在輸出中加入 friendly name `(客廳電視 Samsung)` / `(房間電視 Samsung AU9000 55 TV)`，讓 LLM 靠名稱而非 ID 來判斷。
+Testing revealed the LLM would confuse samsung_au9000_55_tv and samsung_au9000_55_tv_2 (very similar entity_ids), causing it to control the wrong TV. Fix: include friendly names in parentheses so the LLM identifies devices by name rather than ID.
 
-### Token 對比
+### Token Comparison
 
-| 指標 | Phase 2（entity list in prompt）| Phase 3（state injection）| 改善 |
+| Metric | Phase 2 (entity list in prompt) | Phase 3 (state injection) | Improvement |
 |-----|-------------------------------|-------------------------|------|
 | Input tokens | ~1,729 | ~293 | **-83%** |
-| Output tokens | ~9-73 | ~4-43 | 穩定低 |
-| LLM bedrock latency | ~1,405ms | ~1,150ms | -18% |
-| Response consistency | 中（偶爾猜錯 entity）| **100%** | ✅ |
+| Output tokens | ~9-73 | ~4-43 | Consistently low |
+| LLM Bedrock latency | ~1,405ms | ~1,150ms | -18% |
+| Response consistency | Medium (occasionally wrong entity) | **100%** | OK |
 
-**為什麼 input tokens 反而更少？** Phase 2 把 43 個 entity 全塞進 prompt（~1,250 tokens），Phase 3 只注入「當前需要知道的」狀態（~10 個重點裝置 = ~200 tokens），加上精簡的控制指令模板。
+**Why are input tokens actually lower?** Phase 2 crammed all 43 entities into the prompt (~1,250 tokens). Phase 3 only injects what needs to be known right now (the ~10 key devices = ~200 tokens), plus a streamlined control command template.
 
 ---
 
-## Phase 4：端到端實測 — 真的去開關電視
+## Phase 4: End-to-End Test - Actually Turning the TV On and Off
 
-Phase 1-3 都是單獨測 API 或 LLM，Phase 4 是完整跑一次「使用者說話 → 電視動作」的全流程。
+Phases 1-3 tested the API or LLM in isolation. Phase 4 runs the full pipeline: user speaks, TV acts.
 
-### 測試 A：關閉房間電視（電視原本是 on）
+### Test A: Turn Off Bedroom TV (TV was on)
 
-| 步驟 | 動作 | 延遲 | 說明 |
+| Step | Action | Latency | Notes |
 |------|------|------|------|
-| Step 1 | Cache lookup | **0ms** | 從 cache 查「房間電視」= `samsung_au9000_55_tv_2` |
-| Step 2 | HA GET 即時狀態 | **573ms** | 打 API 確認電視目前是 on |
-| Step 3 | Idempotency check | **0ms** | 狀態不符合（要關但現在是 on），需要執行 |
-| Step 4 | LLM inference | **2,333ms** | 生成 exec 指令（43 tokens） |
-| Step 5 | HA POST turn_off | **2,896ms** ⚠️ | 送關機指令，等 Samsung 設備 ACK |
-| Step 6 | HA GET verify | **537ms** | 確認狀態已變成 off |
+| Step 1 | Cache lookup | **0ms** | Looked up "bedroom TV" from cache = media_player.samsung_au9000_55_tv_2 |
+| Step 2 | HA GET live state | **573ms** | API call confirms TV is currently on |
+| Step 3 | Idempotency check | **0ms** | State does not match goal (want off, currently on) - action needed |
+| Step 4 | LLM inference | **2,333ms** | Generated exec command (43 tokens) |
+| Step 5 | HA POST turn_off | **2,896ms** | Sent turn-off command, waited for Samsung device ACK |
+| Step 6 | HA GET verify | **537ms** | Confirmed state changed to off |
 | **Total** | | **6,339ms** | |
 
-> **Step 5 為什麼要 2.9 秒？** 這是 Samsung SmartThings integration 的行為。Samsung TV 收到關機指令後需要時間完成關機流程，HA 會等設備回傳 ACK 才返回。這是設備層延遲，不是網路或 API 問題。
+> **Why does Step 5 take 2.9 seconds?** This is the behavior of the Samsung SmartThings integration. After the Samsung TV receives the turn-off command, it needs time to complete the shutdown process, and HA waits for the device to send an ACK before returning. This is device-layer latency, not a network or API issue.
 
-### 測試 B：開啟房間電視（電視原本是 off）
+### Test B: Turn On Bedroom TV (TV was off)
 
-| 步驟 | 動作 | 延遲 | 說明 |
+| Step | Action | Latency | Notes |
 |------|------|------|------|
 | Step 1 | Cache lookup | **0ms** | |
-| Step 2 | HA GET 即時狀態 | **584ms** | 確認電視是 off |
-| Step 3 | Idempotency check | **0ms** | 需要執行 |
+| Step 2 | HA GET live state | **584ms** | Confirmed TV is off |
+| Step 3 | Idempotency check | **0ms** | Action needed |
 | Step 4 | LLM inference | **2,406ms** | |
-| Step 5 | HA POST turn_on | **539ms** ✅ | 開機比關機快得多 |
+| Step 5 | HA POST turn_on | **539ms** | Power-on is much faster than power-off |
 | Step 6 | HA GET verify | **538ms** | |
 | **Total** | | **4,067ms** | |
 
-### Idempotency 設計
+### Idempotency Design
 
-如果使用者說「把電視關掉」但電視已經是 off：
-- **舊架構：** 照樣送 turn_off → Samsung 等 ACK timeout → 白白浪費 3 秒
-- **新架構：** Step 3 檢查狀態已符合 → 跳過 Step 5 → 直接回答「電視已經是關閉狀態」
+If the user says "turn off the TV" but the TV is already off:
+- **Old architecture:** Sends turn_off anyway, Samsung waits for ACK timeout, wastes ~3 seconds
+- **New architecture:** Step 3 detects state already matches goal, skips Step 5, immediately replies "The TV is already off"
 
-這讓重複指令的回應時間從 ~6 秒降到 ~3 秒。
-
----
-
-## 架構設計：Cache vs API 的分工
-
-在優化過程中，我們遇到一個根本性的設計問題：**Cache 應該負責什麼？**
-
-### 問題
-
-如果 cache 同時存「entity_id mapping」和「裝置狀態」，當使用者用實體遙控器、手動開關操作裝置時，cache 的狀態就會過時。LLM 讀到過時的 cache，就會給出錯誤答案。
-
-### 驗證
-
-我們模擬了這個情境：
-
-```
-場景：使用者用實體遙控器把電視關掉，但 cache 還沒更新
-
-Live (HA API):  off   ← 真實狀態
-Cache（過時）:  on    ← cache 以為電視是開的
-
-舊架構（讀 cache state）：LLM 回答「電視是開的」 ❌
-新架構（打 HA API）：    LLM 回答「電視是關的」 ✅
-```
-
-### 最終設計原則
-
-```
-Cache（.ha-entities.json）  →  只負責 entity_id mapping（名字對照表）
-                                「客廳電視」= media_player.ke_ting_dian_shi_samsung
-                                這個資訊不會因為實體按鈕而改變
-
-HA API（即時呼叫）          →  負責裝置當前狀態（開/關/位置）
-                                永遠打 API，即使慢 550ms
-                                實體按鈕操作立即反映
-```
-
-一句話：**Cache 告訴 LLM「誰是誰」，API 告訴 LLM「現在怎樣」。**
+This reduces repeated-command response time from ~6 seconds to ~3 seconds.
 
 ---
 
-## 最終成果對比
+## Architecture Design: Cache vs API Responsibilities
 
-### 各階段延遲進化
+During optimization we encountered a fundamental design question: **what should the cache be responsible for?**
 
-| 階段 | 架構 | 端到端 avg | 改善 |
+### The Problem
+
+If the cache stores both entity_id mappings and device states, then when someone operates a device with a physical remote or manual switch, the cached state becomes stale. The LLM reads stale cache and gives wrong answers.
+
+### Verification
+
+We simulated this scenario:
+
+```
+Scenario: User turns off TV with physical remote, cache not yet updated
+
+Live (HA API):  off   <- real state
+Cache (stale):  on    <- cache thinks TV is on
+
+Old architecture (reads cache state): LLM answers "TV is on"  (wrong)
+New architecture (calls HA API):      LLM answers "TV is off" (correct)
+```
+
+### Final Design Principle
+
+```
+Cache (.ha-entities.json)  ->  Only entity_id mapping (name lookup table)
+                               "Living room TV" = media_player.ke_ting_dian_shi_samsung
+                               This info does not change when a physical button is pressed
+
+HA API (live call)         ->  Current device state (on/off/location)
+                               Always call the API, even if it costs 550ms
+                               Physical button operations are reflected immediately
+```
+
+In one sentence: **Cache tells the LLM "who is who"; the API tells the LLM "what is happening now."**
+
+---
+
+## Final Results
+
+### Latency Evolution Across Phases
+
+| Phase | Architecture | End-to-end avg | Improvement |
 |-----|------|-----------|------|
-| **Baseline** | LLM 自己猜 entity_id + 生成大量推理文字 | **>8,000ms** | — |
-| **Phase 2** | Entity cache 注入 prompt + LLM 查表 | **~3,400ms** | -58% |
-| **Phase 3** | State injection + strict output | **~1,000ms**（純查詢）| -88% |
-| **Phase 4** | 完整開關（含 HA 執行）| **~4,000ms**（開機）| -50% |
+| **Baseline** | LLM guesses entity_ids + generates heavy reasoning text | **>8,000ms** | - |
+| **Phase 2** | Entity cache injected into prompt + LLM does table lookup | **~3,400ms** | -58% |
+| **Phase 3** | State injection + strict output | **~1,000ms** (query-only) | -88% |
+| **Phase 4** | Full power-on/off (including HA execution) | **~4,000ms** (power-on) | -50% |
 
-### Token 使用進化
+### Token Usage Evolution
 
-| 階段 | Input Tokens | Output Tokens | 說明 |
+| Phase | Input Tokens | Output Tokens | Notes |
 |-----|-------------|--------------|------|
-| Baseline | ~200 | ~145 | LLM 大量推理猜測 |
-| Phase 2 | ~1,729 | ~73 | 查表減少 output，但 entity list 膨脹 input |
-| Phase 3 | ~293 | ~9-43 | 只注入需要的狀態，output 壓到最低 |
+| Baseline | ~200 | ~145 | LLM generates heavy reasoning/guessing |
+| Phase 2 | ~1,729 | ~73 | Table lookup reduces output, but entity list bloats input |
+| Phase 3 | ~293 | ~9-43 | Only inject needed state; output minimized |
 
-### 延遲佔比變化
+### Latency Proportion Shift
 
 ```
-Baseline（~8,000ms）：
-  HA API   ██░░░░░░░░░░░░░░░░░░  700ms  (9%)
-  LLM 推理 ██████████████████░░  7,300ms (91%) ← 幾乎全在 LLM
+Baseline (~8,000ms):
+  HA API:        700ms   (9%)
+  LLM Inference: 7,300ms (91%) <- Almost entirely LLM
 
-Phase 4（~4,000ms，開機）：
-  Cache    ░░░░░░░░░░░░░░░░░░░░  0ms    (0%)
-  HA GET   ███░░░░░░░░░░░░░░░░░  580ms  (14%)
-  LLM      ████████████░░░░░░░░  2,400ms (59%)
-  HA POST  █████░░░░░░░░░░░░░░░  540ms  (13%)
-  HA verify██░░░░░░░░░░░░░░░░░░  540ms  (13%)
+Phase 4 (~4,000ms, power-on):
+  Cache:     0ms     (0%)
+  HA GET:    580ms   (14%)
+  LLM:       2,400ms (59%)
+  HA POST:   540ms   (13%)
+  HA verify: 540ms   (13%)
 ```
 
-**LLM 佔比從 91% 降到 59%。** 剩下的 LLM 延遲（~2,400ms）主要是 Bedrock 冷啟動和網路往返，需要靠更快的模型或 streaming 來壓縮。
+**LLM share dropped from 91% to 59%.** The remaining LLM latency (~2,400ms) is primarily Bedrock cold-start and network round-trip; reducing it further requires a faster model or streaming.
 
 ---
 
-## 腳本清單
+## Scripts
 
-| 腳本 | 功能 | Latency |
+| Script | Function | Latency |
 |------|------|---------|
-| `ha-service.sh` | HA REST API 服務呼叫（開關裝置） | ~550ms |
-| `ha-update-cache.sh` | 全量更新 entity cache（43 entities） | ~880ms |
-| `ha-query-cache.sh` | 模糊搜尋 entity_id ↔ friendly_name | **~0ms** |
-| `ha-state-inject.sh` | 從 HA API 拉即時狀態，輸出供 LLM context 注入 | ~550ms |
+| `ha-service.sh` | HA REST API service calls (turn devices on/off) | ~550ms |
+| `ha-update-cache.sh` | Full entity cache update (43 entities) | ~880ms |
+| `ha-query-cache.sh` | Fuzzy search entity_id to friendly_name | ~0ms |
+| `ha-state-inject.sh` | Pulls live state from HA API, outputs for LLM context | ~550ms |
 
 ---
 
-## 下一步
+## Next Steps
 
-### 可以繼續壓的方向
+### Directions for Further Optimization
 
-1. **Streaming 回應** — 啟用 Bedrock streaming，使用者立即看到「正在執行...」，感知延遲降低 ~1-2 秒
-2. **分層模型** — 簡單指令（開關）用 Haiku（快），複雜場景（自動化排程）用 Sonnet（準）
-3. **HA Automation 預建** — 高頻操作（「晚安模式」）直接觸發 HA automation，繞過 LLM，端到端 < 800ms
+1. **Streaming responses** - Enable Bedrock streaming so the user immediately sees "Executing...", reducing perceived latency by ~1-2 seconds
+2. **Tiered models** - Use Haiku (fast) for simple commands (on/off), Sonnet (accurate) for complex scenarios (automation scheduling)
+3. **Pre-built HA Automations** - High-frequency operations ("goodnight mode") trigger HA automations directly, bypassing the LLM for end-to-end under 800ms
 
-### 不能壓的部分
+### Hard Limits
 
-- **HA API ~550ms** — 物理網路延遲（EC2 → Tailscale → 家庭網路），除非把 agent 部署到家裡
-- **Samsung 關機 ACK ~2.9s** — 設備層行為，非軟體可控
-
----
-
-## 經驗總結
-
-1. **先量後改。** 拆解延遲佔比比猜測優化方向重要 100 倍。我們一開始以為瓶頸在 HA API，結果 91% 的時間花在 LLM 猜 entity_id。
-2. **讓 LLM 少思考。** Entity cache 的本質是把「推理」變成「查表」——output tokens 從 145 降到 9，這才是最大的加速。
-3. **Cache 和 API 職責要分清。** Cache 存「不常變的東西」（名字對照），API 查「會變的東西」（即時狀態）。混在一起就會出一致性問題。
-4. **嚴格限制 LLM output。** 不給 LLM 說廢話的空間，它就不會說。104 tokens → 43 tokens，光這一步就省了 500ms+。
-5. **設備層延遲是硬限制。** Samsung TV 關機要 3 秒，這不是 bug，是物理世界的速度。接受它，設計 idempotency 繞過不必要的呼叫。
+- **HA API ~550ms** - Physical network latency (EC2 to Tailscale to home network); only reducible by deploying the agent locally at home
+- **Samsung power-off ACK ~2.9s** - Device-layer behavior, not controllable by software
 
 ---
 
-*更新時間：2026-02-21 19:59 UTC*
+## Lessons Learned
+
+1. **Measure before you optimize.** Breaking down latency proportions is 100x more valuable than guessing where to optimize. We initially assumed the bottleneck was the HA API; it turned out 91% of time was spent on the LLM guessing entity_ids.
+2. **Make the LLM think less.** The essence of entity caching is turning reasoning into table lookup - output tokens dropped from 145 to 9, and that is the biggest speedup.
+3. **Separate cache and API responsibilities clearly.** Cache stores things that rarely change (name mappings); the API queries things that do change (live state). Mixing them creates consistency issues.
+4. **Strictly constrain LLM output.** Give the LLM no room to talk unnecessarily, and it will not. 104 tokens to 43 tokens - this single step saved 500ms or more.
+5. **Device-layer latency is a hard limit.** A Samsung TV takes 3 seconds to power off; that is not a bug, it is the speed of the physical world. Accept it and design idempotency to avoid unnecessary calls.
+
+---
+
+*Updated: 2026-02-21 19:59 UTC*
