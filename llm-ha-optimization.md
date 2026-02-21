@@ -50,9 +50,9 @@ Molly 是我們的智能家居 AI agent，負責透過 Home Assistant 控制家�
 | 單一控制（「開電視」）| 1,231ms | 29 | 最簡單 |
 | 狀態查詢（「TV 開著嗎」）| 1,475ms | 99 | 需要查找 + 回答 |
 | 中文自然語言 | 2,261ms | 29 | 中文解析開銷 |
-| 人物查詢（「Mr. sha 在哪」）| **3,615ms** | **89** | 最慢——LLM 不知道 entity_id |
+| 人物查詢（「某人在哪」）| **3,615ms** | **89** | 最慢——LLM 不知道 entity_id |
 
-**關鍵發現：延遲跟 output tokens 高度正相關。** 人物查詢最慢不是因為問題複雜，而是 LLM 在「猜」entity_id。它不知道 `device_tracker.mr_sha` 這個 ID，所以會生成一堆推理文字（「讓我查找...」「根據 Home Assistant 的命名規則...」），吃掉 89 個 output tokens。
+**關鍵發現：延遲跟 output tokens 高度正相關。** 人物查詢最慢不是因為問題複雜，而是 LLM 在「猜」entity_id。它不知道對應的 `device_tracker` entity ID，所以會生成一堆推理文字（「讓我查找...」「根據 Home Assistant 的命名規則...」），吃掉 89 個 output tokens。
 
 **整體統計：LLM avg=2,068ms, p50=1,479ms, p95=3,770ms**
 
@@ -89,7 +89,7 @@ Molly 是我們的智能家居 AI agent，負責透過 Home Assistant 控制家�
 注入的格式：
 ```
 - media_player.ke_ting_dian_shi_samsung — 客廳電視 Samsung
-- device_tracker.mr_sha — Mr. sha（手機位置）
+- device_tracker.user_phone — 使用者（手機位置）
 - sensor.sun_next_setting — 下次日落時間
 ```
 
@@ -100,7 +100,7 @@ Molly 是我們的智能家居 AI agent，負責透過 Home Assistant 控制家�
 | 指令 | Baseline 延遲 | Optimized 延遲 | Baseline Out Tokens | Optimized Out Tokens |
 |-----|-------------|--------------|-------------------|-------------------|
 | TV 現在開著嗎？ | 1,889ms | 3,681ms | 86 | 36 |
-| Mr. sha 在不在家 | **6,071ms** | **1,714ms** | **200** | **28** | 
+| Mr. X 在不在家 | **6,071ms** | **1,714ms** | **200** | **28** | 
 | 把客廳電視關掉 | 1,900ms | 4,091ms | 92 | 48 |
 | 現在幾點日落？ | 4,710ms | 4,953ms | 200 | 85 |
 | 有幾個媒體播放器？ | 4,059ms | 2,577ms | 148 | 167 |
@@ -111,7 +111,7 @@ Molly 是我們的智能家居 AI agent，負責透過 Home Assistant 控制家�
 
 **Output tokens 平均從 145 → 73，減少 50%。** Optimized prompt 讓 LLM 直接輸出 entity_id，不再生成推理文字。但 input tokens 增加了 ~1,250（entity list 的成本），在某些簡單指令上 input 增加的延遲 > output 減少的收益。
 
-**真正的價值在「難題」上。** Mr. sha 在不在家這個查詢：
+**真正的價值在「難題」上。** 「某人在不在家」這個查詢：
 - Baseline：LLM 不知道 entity_id → 猜測 → 200 tokens → **6,071ms**
 - Optimized：直接查表 → 28 tokens → **1,714ms**（**-72%**）
 
@@ -157,7 +157,7 @@ Phase 2 解決了「LLM 不知道 entity_id」的問題，但 LLM 的 output 還
 === Device States (19:18 UTC) ===
 media_player.ke_ting_dian_shi_samsung=off (客廳電視 Samsung)
 media_player.samsung_au9000_55_tv_2=on (房間電視 Samsung AU9000 55 TV)
-device_tracker.mr_sha=not_home (Mr. sha)
+device_tracker.user_phone=not_home (使用者)
 ```
 
 LLM 不需要「查」任何東西——狀態已經在 context 裡了。它只需要根據狀態做判斷。
